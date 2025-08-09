@@ -1,86 +1,115 @@
 # input_handler.py
-# -*- coding: utf-8 -*-
-# 각종 영상 정보 소스를 통일된 인터페이스로 뽑아주는 모듈
-
-import cv2
-from picamera2 import Picamera2
-from config import FRAME_WIDTH, FRAME_HEIGHT
-
-class InputHandler:
-    def __init__(self, width=FRAME_WIDTH, height=FRAME_HEIGHT):
-        """
-        영상 소스 초기화: Raspberry Pi CSI 카메라 (Picamera2)
-        :param width: 캡처 해상도 너비
-        :param height: 캡처 해상도 높이
-        """
-        self.picam2 = Picamera2()
-        preview_config = self.picam2.create_preview_configuration({
-            "size": (width, height),
-            "format": "RGB888"
-        })
-        self.picam2.configure(preview_config)
-        self.picam2.start()
-
-    def is_opened(self):
-        """
-        Picamera2 연결 여부 확인 (항상 True 반환)
-        """
-        return True
-
-    def get_frame(self):
-        """
-        한 프레임을 읽어서 BGR 이미지로 반환합니다.
-        :return: BGR 이미지(np.ndarray)
-        """
-        rgb = self.picam2.capture_array()
-        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-    def release(self):
-        """
-        캡처 리소스를 해제합니다.
-        """
-        self.picam2.stop()
-
-
-'''
-# input_handler.py
-# 각종 영상 정보 소스를 통일된 인터페이스로 뽑아주는 모듈
+# 횇챘횉횛 ?횚쨌횂 횉횣쨉챕쨌짱 (Picamera2 쩔챙쩌짹, 횈횆?횕 ?횚쨌횂?쨘 OpenCV쨌횓 횄쨀쨍짰)
 
 import cv2
 from config import FRAME_WIDTH, FRAME_HEIGHT
+
+try:
+    from picamera2 import Picamera2
+    _HAS_PICAMERA2 = True
+except Exception:
+    _HAS_PICAMERA2 = False
+
 
 class InputHandler:
     def __init__(self, source=0, width=FRAME_WIDTH, height=FRAME_HEIGHT):
         """
-        영상 소스 초기화
-        :param source: int(웹캠 인덱스) 또는 str(동영상 파일 경로)
+        쩔쨉쨩처 쩌횘쩍쨘 횄횎짹창횊짯
+        :param source: int/None -> Raspberry Pi 횆짬쨍횧쨋처(Picamera2),
+                       str -> 쨉쩔쩔쨉쨩처 횈횆?횕 째챈쨌횓(OpenCV)
         """
+        self.width = int(width)
+        self.height = int(height)
+
+        self._mode = None           # "picam2" or "cv2"
+        self.cap = None             # for cv2
+        self.picam2 = None          # for picamera2
+        self._opened = False
+
+        # 횈횆?횕 째챈쨌횓(str)?횑쨍챕 OpenCV쨌횓 횄쨀쨍짰
+        if isinstance(source, str):
+            self._init_cv2(source)
+            return
+
+        # 짹창쨘쨩: 쨋처횁챤쨘짙쨍짰횈횆?횑 횆짬쨍횧쨋처 쩍횄쨉쨉
+        if _HAS_PICAMERA2:
+            self._init_picam2()
+        else:
+            # Picamera2째징 쩐첩?쨍쨍챕 ?짜횆쨌(OpenCV)쨌횓 쩍횄쨉쨉
+            self._init_cv2(source)
+
+    def _init_picam2(self):
+        try:
+            self.picam2 = Picamera2()
+            config = self.picam2.create_video_configuration(
+                main={"size": (self.width, self.height), "format": "RGB888"}
+            )
+            self.picam2.configure(config)
+            self.picam2.start()
+            self._mode = "picam2"
+            self._opened = True
+        except Exception as e:
+            print(f"?? Picamera2 횄횎짹창횊짯 쩍횉횈횖: {e}")
+            self._opened = False
+
+    def _init_cv2(self, source):
         self.cap = cv2.VideoCapture(source)
-        # 카메라가 안 열리면 경고
         if not self.cap.isOpened():
-            print(f"⚠️ 카메라 열기 실패 (source={source})")
-        # 캡처 해상도 설정
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        
+            print(f"?? 횆짬쨍횧쨋처/횈횆?횕 쩔짯짹창 쩍횉횈횖 (source={source})")
+            self._opened = False
+            self._mode = "cv2"
+            return
+        # 횉횠쨩처쨉쨉 쩌쨀횁짚 (째징쨈횋횉횗 째챈쩔챙쩔징쨍쨍 쨔횦쩔쨉)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self._mode = "cv2"
+        self._opened = True
+
     def is_opened(self):
-        return self.cap.isOpened()
+        return self._opened
 
     def get_frame(self):
         """
-        한 프레임을 읽어서 반환합니다.
-        읽기 실패 시 None을 반환합니다.
-        :return: BGR 이미지(np.ndarray) 또는 None
+        횉횗 횉횁쨌쨔?횙?쨩 ?횖쩐챤쩌짯 쨔횦횊짱(BGR).
+        쩍횉횈횖 쩍횄 None.
         """
-        success, frame = self.cap.read()
-        if not success:
+        if not self._opened:
             return None
-        return frame
+
+        if self._mode == "picam2":
+            try:
+                # Picamera2쨈횂 RGB 쨔챔쩔짯?쨩 쨔횦횊짱 -> BGR쨌횓 쨘짱횊짱횉횠 OpenCV 횊짙횊짱
+                frame_rgb = self.picam2.capture_array()
+                if frame_rgb is None:
+                    return None
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                return frame_bgr
+            except Exception as e:
+                print(f"?? Picamera2 횉횁쨌쨔?횙 횆쨍횄쨀 쩍횉횈횖: {e}")
+                return None
+
+        elif self._mode == "cv2":
+            success, frame = self.cap.read()
+            if not success:
+                return None
+            return frame
+
+        return None
 
     def release(self):
         """
-        캡처 리소스를 해제합니다.
+        횆쨍횄쨀 쨍짰쩌횘쩍쨘 횉횠횁짝
         """
-        if self.cap.isOpened():
-            self.cap.release()
-'''
+        if self._mode == "picam2" and self.picam2 is not None:
+            try:
+                self.picam2.stop()
+            except Exception:
+                pass
+            self.picam2 = None
+            self._opened = False
+
+        if self._mode == "cv2" and self.cap is not None:
+            if self.cap.isOpened():
+                self.cap.release()
+            self.cap = None
+            self._opened = False
