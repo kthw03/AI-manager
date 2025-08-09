@@ -83,7 +83,8 @@ class InputHandler:
                 if frame_rgb is None:
                     return None
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                return frame_bgr
+                #return frame_bgr
+                return frame_rgb
             except Exception as e:
                 print(f"?? Picamera2 횉횁쨌쨔?횙 횆쨍횄쨀 쩍횉횈횖: {e}")
                 return None
