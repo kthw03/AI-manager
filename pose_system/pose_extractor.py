@@ -38,7 +38,7 @@ class PoseExtractor:
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
-            model_complexity=1,
+            model_complexity=2,
             enable_segmentation=False,
             min_detection_confidence=MP_DETECT_CONFIDENCE,
             min_tracking_confidence=MP_TRACK_CONFIDENCE
