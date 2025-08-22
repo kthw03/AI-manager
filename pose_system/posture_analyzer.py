@@ -22,6 +22,8 @@ AnalyzedFrame = namedtuple(
 
 COOL_DOWN = 5.0
 
+META_KEYS = ("in_roi", "duration_sec", "changes", "threshold", "nose_minus_hip_z")
+
 
 def _is_lying(label: str) -> bool:
     return label.startswith("lying")
@@ -111,7 +113,6 @@ class PostureAnalyzerV4:
             self._motionless_start = None
             return False
 
-        # distance helper for (x, y, z, v) tuples
         class P:
             __slots__ = ("x", "y")
             def __init__(self, x: float, y: float):
@@ -204,42 +205,59 @@ class PostureAnalyzerV4:
             prev = f.label
         return changes >= ANALYZER_IRREGULAR_THRESHOLD
 
+    # ----------------- meta unification helpers ----------------- #
+
+    def _meta_template(self, base: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
+        out = {k: None for k in META_KEYS}
+        if base:
+            for k in META_KEYS:
+                if k in base:
+                    out[k] = base[k]
+        for k, v in kwargs.items():
+            if k in META_KEYS:
+                out[k] = v
+        return out
+
+    def _normalize_meta(self, meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        return self._meta_template(meta or {})
+
     # ----------------- unified public event wrappers ----------------- #
 
     def is_motionless_sustained(self) -> Tuple[bool, Dict[str, Any]]:
         now = time.monotonic()
         ok = self._check_motionless(now)
         last = self.buffer[-1] if self.buffer else None
-        meta = {
-            "duration_sec": float(NO_MOVEMENT_TIME_THRESHOLD),
-            "in_roi": (last.in_roi if last else None),
-        }
+        meta = self._meta_template(
+            duration_sec=float(NO_MOVEMENT_TIME_THRESHOLD),
+            in_roi=(last.in_roi if last else None),
+        )
         return ok, meta
 
     def is_tilt_sustained(self) -> Tuple[bool, Dict[str, Any]]:
         now = time.monotonic()
         ok = self._check_tilt(now)
-        meta = {"duration_sec": float(TILT_DURATION)}
+        meta = self._meta_template(duration_sec=float(TILT_DURATION))
         return ok, meta
 
     def is_fall_event(self) -> Tuple[bool, Dict[str, Any]]:
         ok = self.is_fall_detected()
         last = self.buffer[-1] if self.buffer else None
-        meta = {
-            "in_roi": (last.in_roi if last else None),
-        }
+        meta = self._meta_template(in_roi=(last.in_roi if last else None))
         return ok, meta
 
     def is_prone_event(self) -> Tuple[bool, Dict[str, Any]]:
         ok = self.is_prone_warning()
-        meta: Dict[str, Any] = {}
-        if ok and self.buffer and self.buffer[-1].landmarks and len(self.buffer[-1].landmarks) > 24:
-            lm = self.buffer[-1].landmarks
+        nmhz = None
+        if self.buffer and self.buffer[-1].landmarks and len(self.buffer[-1].landmarks) > 24:
             try:
-                meta["nose_minus_hip_z"] = lm[0][2] - (lm[23][2] + lm[24][2]) / 2.0
-                meta["threshold"] = float(POSE_Z_PRONE_THRESHOLD)
+                lm = self.buffer[-1].landmarks
+                nmhz = lm[0][2] - (lm[23][2] + lm[24][2]) / 2.0
             except Exception:
-                pass
+                nmhz = None
+        meta = self._meta_template(
+            nose_minus_hip_z=nmhz,
+            threshold=float(POSE_Z_PRONE_THRESHOLD),
+        )
         return ok, meta
 
     def is_irregular_event(self) -> Tuple[bool, Dict[str, Any]]:
@@ -250,7 +268,10 @@ class PostureAnalyzerV4:
                 changes += 1
             prev = f.label
         ok = changes >= ANALYZER_IRREGULAR_THRESHOLD
-        meta = {"changes": int(changes), "threshold": int(ANALYZER_IRREGULAR_THRESHOLD)}
+        meta = self._meta_template(
+            changes=int(changes),
+            threshold=int(ANALYZER_IRREGULAR_THRESHOLD),
+        )
         return ok, meta
 
     # ----------------- event collection with cooldown ----------------- #
@@ -269,9 +290,9 @@ class PostureAnalyzerV4:
             events.append({
                 "type": ev_type,
                 "severity": severity,
-                "timestamp": get_timestamp(),  # utils.get_timestamp() has no args
+                "timestamp": get_timestamp(),
                 "message": message,
-                "meta": meta or {},
+                "meta": self._normalize_meta(meta),
             })
             self._last_event_ts[ev_type] = now
 
