@@ -1,4 +1,4 @@
-# posture_analyzer_v4.py
+# posture_analyzer.py
 import time
 from collections import deque, namedtuple
 from typing import Deque, List, Dict, Optional, Tuple, Any, TYPE_CHECKING
@@ -59,11 +59,16 @@ class PostureAnalyzerV4:
     """
 
     def __init__(self, roi_manager: "Optional[ROIManager]" = None):
-        self.roi_manager = roi_manager               # ROI 포함 판정에만 사용
-        self.buffer: Deque[AnalyzedFrame] = deque()  # 최근 프레임 슬라이딩 버퍼
+        # ROI 포함 판정에 사용할 매니저(없어도 동작)
+        self.roi_manager = roi_manager
+        # 최근 프레임 슬라이딩 버퍼
+        self.buffer: Deque[AnalyzedFrame] = deque()
+        # 마지막 분류 라벨(편의상 저장)
         self.last_label: Optional[str] = None
 
-        self._last_event_ts: Dict[str, float] = {}   # 이벤트별 마지막 발행 시각
+        # 이벤트별 마지막 발행 시각(쿨다운 관리)
+        self._last_event_ts: Dict[str, float] = {}
+        # 무동작/기울기 상태 시작 시각
         self._motionless_start: Optional[float] = None
         self._tilt_start: Optional[float] = None
 
@@ -90,11 +95,14 @@ class PostureAnalyzerV4:
             except Exception:
                 sh_y = None
 
-        # ROI 포함 여부(in_roi) 계산: 실패 시 보수적으로 True 처리
+        # ROI 포함 여부(in_roi) 계산: ROI가 실제 존재할 때만 검사(없으면 의미 없으므로 True)
         in_roi = True
         if self.roi_manager and bbox is not None:
             try:
-                in_roi = self.roi_manager.is_bbox_in_roi(bbox)
+                if self._has_roi():
+                    in_roi = self.roi_manager.is_bbox_in_roi(bbox)
+                else:
+                    in_roi = True
             except Exception:
                 in_roi = True
 
