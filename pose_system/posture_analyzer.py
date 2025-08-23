@@ -1,7 +1,7 @@
 # posture_analyzer_v4.py
 import time
 from collections import deque, namedtuple
-from typing import Deque, List, Dict, Optional, Tuple, Any
+from typing import Deque, List, Dict, Optional, Tuple, Any, TYPE_CHECKING
 
 from utils import calculate_euclidean_distance, get_timestamp
 from config import (
@@ -14,46 +14,56 @@ from config import (
     ANALYZER_IRREGULAR_THRESHOLD,
 )
 
+# 타입 힌트 전용 임포트(실행 시 순환참조 방지)
+if TYPE_CHECKING:
+    from roi_manager import ROIManager
+
+# 분석 버퍼에 저장할 프레임 구조
 AnalyzedFrame = namedtuple(
     "AnalyzedFrame",
     ["monotonic_ts", "wall_ts", "label", "shoulder_y", "landmarks", "in_roi"]
 )
 
+# 동일 이벤트 재발행 쿨다운(초)
 COOL_DOWN = 5.0
 
-# 메타 키(출력 형식 유지)
+# 이벤트 메타 필드(출력 형식 통일)
 META_KEYS = ("in_roi", "duration_sec", "changes", "threshold", "nose_minus_hip_z")
 
-# === 신규 규칙 임계값 (요구사항) ===
-STANDING_TILT_DURATION = 1.0          # 1) standing_tilt 1초 이상 → falling_warning
-OFFROI_LOWPOSTURE_DURATION = 1.0      # 2) ROI 밖에서 sitting/lying 1초 이상 → falling_detect
-NO_PERSON_DURATION = 1.0              # 3) 1초 이상 사람 미검출 → patient_escape
+# === 신규 규칙 임계값 ===
+STANDING_TILT_DURATION = 1.0          # standing_tilt 1초 이상 → falling_warning
+OFFROI_LOWPOSTURE_DURATION = 1.0      # ROI 밖에서 sitting/lying 1초 이상 → falling_detect
+NO_PERSON_DURATION = 1.0              # 1초 이상 사람 미검출 → patient_escape
 
-# === 서있음 무동작(추가 제안 4) ===
-STANDING_FREEZE_DURATION = 10.0       # 서있음에서 무동작 지속 시간
+# === 서있음 무동작(추가 제안) ===
+STANDING_FREEZE_DURATION = 10.0       # 서 있음에서 무동작 지속 시간
 STANDING_MAJORITY_RATIO = 0.70        # 윈도우 내 standing 비율 임계
 
+
 def _is_lying(label: str) -> bool:
+    """lying 계열 레이블인지 검사."""
     return label.startswith("lying")
 
+
 def _is_low_posture(label: str) -> bool:
-    # sitting 또는 lying 전체 포함
+    """앉음 또는 누움 전체를 '낮은 자세'로 간주."""
     return (label == "sitting") or _is_lying(label)
 
 
 class PostureAnalyzerV4:
     """
-    Time-based posture/event analyzer with a sliding window.
-    - Internal timing: time.monotonic()
-    - Event timestamps: get_timestamp() based on wall clock
+    시간 기반 슬라이딩 윈도우로 자세/이벤트를 분석하는 클래스.
+    - 내부 타이밍: time.monotonic() (드리프트 없는 상대 시계)
+    - 이벤트 타임스탬프: get_timestamp() (벽시계 문자열)
+    - ROI는 외부에서 ROIManager 인스턴스를 '주입'(DI) 받아 사용
     """
 
-    def __init__(self, roi_manager: Any = None):
-        self.roi_manager = roi_manager
-        self.buffer: Deque[AnalyzedFrame] = deque()
+    def __init__(self, roi_manager: "Optional[ROIManager]" = None):
+        self.roi_manager = roi_manager               # ROI 포함 판정에만 사용
+        self.buffer: Deque[AnalyzedFrame] = deque()  # 최근 프레임 슬라이딩 버퍼
         self.last_label: Optional[str] = None
 
-        self._last_event_ts: Dict[str, float] = {}
+        self._last_event_ts: Dict[str, float] = {}   # 이벤트별 마지막 발행 시각
         self._motionless_start: Optional[float] = None
         self._tilt_start: Optional[float] = None
 
@@ -63,9 +73,16 @@ class PostureAnalyzerV4:
         landmarks: Optional[List[Tuple[float, float, float, float]]],
         bbox: Optional[Tuple[int, int, int, int]],
     ) -> None:
+        """
+        한 프레임 단위로 분석 버퍼를 갱신.
+        - label: 분류기 결과(standing/sitting/lying*/standing_tilt/no_person 등)
+        - landmarks: 포즈 키포인트 목록(없을 수 있음)
+        - bbox: 사람 바운딩 박스(x1,y1,x2,y2)
+        """
         now_mon = time.monotonic()
         now_wall = time.time()
 
+        # 양쪽 어깨 y의 평균(기울기 탐지에 사용)
         sh_y = None
         if landmarks and len(landmarks) > 12:
             try:
@@ -73,6 +90,7 @@ class PostureAnalyzerV4:
             except Exception:
                 sh_y = None
 
+        # ROI 포함 여부(in_roi) 계산: 실패 시 보수적으로 True 처리
         in_roi = True
         if self.roi_manager and bbox is not None:
             try:
@@ -80,25 +98,27 @@ class PostureAnalyzerV4:
             except Exception:
                 in_roi = True
 
-        # 버퍼 윈도우 유지: 기존 임계 + 신규 임계들까지 보장
+        # 윈도우 유지: 사용되는 모든 임계시간 중 최대치만큼 보존
         cutoff = now_mon - max(
             TILT_DURATION,
             NO_MOVEMENT_TIME_THRESHOLD,
             STANDING_TILT_DURATION,
             OFFROI_LOWPOSTURE_DURATION,
             NO_PERSON_DURATION,
-            STANDING_FREEZE_DURATION,  # ← 추가
+            STANDING_FREEZE_DURATION,
         )
         while self.buffer and self.buffer[0].monotonic_ts < cutoff:
             self.buffer.popleft()
 
+        # 버퍼에 프레임 추가
         self.buffer.append(
             AnalyzedFrame(now_mon, now_wall, label, sh_y, landmarks, in_roi)
         )
         self.last_label = label
 
-    # ----------------- 기존 상태 조회(유지) ----------------- #
+    # ----------------- 상태 조회 ----------------- #
     def get_state(self) -> str:
+        """현재 상태 요약(tilting/motionless/마지막 분류 라벨)."""
         now = time.monotonic()
         if self._check_tilt(now):
             return "tilting"
@@ -106,8 +126,9 @@ class PostureAnalyzerV4:
             return "motionless"
         return self.last_label or "unknown"
 
-    # ----------------- internal sustained checks (기존 유지) ----------------- #
+    # ----------------- 지속 조건 체크 ----------------- #
     def _check_tilt(self, now: float) -> bool:
+        """어깨 y 변화량 기반 기울기 지속 여부."""
         ys: List[float] = []
         for f in reversed(self.buffer):
             if now - f.monotonic_ts > TILT_DURATION:
@@ -128,11 +149,13 @@ class PostureAnalyzerV4:
             return False
 
     def _check_motionless(self, now: float) -> bool:
+        """키포인트 평균 이동량이 임계 미만 상태가 일정 시간 지속되는지 확인."""
         frames = [f for f in self.buffer if now - f.monotonic_ts <= NO_MOVEMENT_TIME_THRESHOLD]
         if len(frames) < 2:
             self._motionless_start = None
             return False
 
+        # 간단한 point 래퍼(유클리디안 거리 함수 호환용)
         class P:
             __slots__ = ("x", "y")
             def __init__(self, x: float, y: float):
@@ -171,19 +194,39 @@ class PostureAnalyzerV4:
         return (now - self._motionless_start) >= NO_MOVEMENT_TIME_THRESHOLD
 
     def has_transition(self, from_label: str, to_label: str) -> bool:
+        """직전 프레임에서 특정 라벨→현재 라벨로 전이가 있었는지 확인."""
         if len(self.buffer) < 2:
             return False
         return self.buffer[-2].label == from_label and self.buffer[-1].label == to_label
 
-    # ----------------- 새 규칙: 이벤트 판정 ----------------- #
+    # ----------------- 윈도우/ROI 헬퍼 ----------------- #
     def _window(self, duration: float) -> List[AnalyzedFrame]:
-        """최근 duration 초의 프레임 집합 반환."""
+        """최근 duration초 구간의 프레임 집합을 반환."""
         now = time.monotonic()
         return [f for f in self.buffer if (now - f.monotonic_ts) <= duration]
 
+    def _has_roi(self) -> bool:
+        """
+        ROI 보유 여부 확인:
+        - roi_manager가 존재하고
+        - get_rois() 또는 rois 속성에 1개 이상 ROI가 있을 때 True
+        """
+        if not self.roi_manager:
+            return False
+        try:
+            if hasattr(self.roi_manager, "get_rois"):
+                rois = self.roi_manager.get_rois()
+            else:
+                rois = getattr(self.roi_manager, "rois", None)
+            return bool(rois and len(rois) > 0)
+        except Exception:
+            return False
+
+    # ----------------- 이벤트 규칙 ----------------- #
     def is_falling_warning(self) -> Tuple[bool, Dict[str, Any]]:
         """
-        1) falling_warning: classifier 라벨 'standing_tilt'가 1초 이상 지속.
+        낙상 경고:
+        - standing_tilt가 STANDING_TILT_DURATION 이상 연속
         """
         frames = self._window(STANDING_TILT_DURATION)
         ok = bool(frames) and all(f.label == "standing_tilt" for f in frames)
@@ -192,11 +235,29 @@ class PostureAnalyzerV4:
 
     def is_falling_detect(self) -> Tuple[bool, Dict[str, Any]]:
         """
-        2) falling_detect: ROI(침대/의자) 외부에서 1초 이상 sitting/lying 유지.
+        낙상 감지(요구사항 반영):
+        1) ROI가 없음(침대/의자 미검출) → OFFROI_LOWPOSTURE_DURATION 동안 sitting/lying이면 낙상
+        2) ROI가 있음 → OFFROI_LOWPOSTURE_DURATION 동안 ROI '밖'에서 sitting/lying이면 낙상
+        3) ROI '안'에서 sitting/lying이면 정상
         """
         frames = self._window(OFFROI_LOWPOSTURE_DURATION)
+        meta = self._meta_template(duration_sec=float(OFFROI_LOWPOSTURE_DURATION))
+
         if not frames:
-            return False, self._meta_template(duration_sec=float(OFFROI_LOWPOSTURE_DURATION))
+            return False, meta
+
+        has_roi = self._has_roi()
+
+        if not has_roi:
+            # ROI 미검출: 자세만으로 판단
+            ok = all(_is_low_posture(f.label) for f in frames)
+            meta = self._meta_template(
+                in_roi=None,  # ROI가 없으므로 판정 불가
+                duration_sec=float(OFFROI_LOWPOSTURE_DURATION),
+            )
+            return ok, meta
+
+        # ROI 보유: ROI 밖 + 낮은 자세가 지속될 때만 낙상
         ok = all((not f.in_roi) and _is_low_posture(f.label) for f in frames)
         meta = self._meta_template(
             in_roi=(frames[-1].in_roi if frames else None),
@@ -206,8 +267,8 @@ class PostureAnalyzerV4:
 
     def is_patient_escape(self) -> Tuple[bool, Dict[str, Any]]:
         """
-        3) patient_escape: 1초 이상 '사람 미검출' 상태.
-           - 라벨이 'no_person'으로 들어온다고 가정.
+        환자 이탈:
+        - 라벨이 'no_person'으로 1초 이상 지속
         """
         frames = self._window(NO_PERSON_DURATION)
         if not frames:
@@ -218,10 +279,10 @@ class PostureAnalyzerV4:
 
     def is_standing_freeze(self) -> Tuple[bool, Dict[str, Any]]:
         """
-        4) standing_freeze: 서 있는 상태에서 장시간(기본 10초) 움직임이 거의 없을 때 경고.
-           - 윈도우 내 standing 비율 ≥ STANDING_MAJORITY_RATIO
-           - 평균 움직임 < ANALYZER_MOTION_THRESHOLD
-           - standing_tilt 경고 활성 중이면 중복 경고 방지로 제외
+        서있음 무동작 경고:
+        - 윈도우(STANDING_FREEZE_DURATION) 내 standing 비율 ≥ STANDING_MAJORITY_RATIO
+        - 평균 움직임 < ANALYZER_MOTION_THRESHOLD
+        - standing_tilt 경고 중이면 중복 경고 방지로 제외
         """
         now = time.monotonic()
         frames = [f for f in self.buffer if now - f.monotonic_ts <= STANDING_FREEZE_DURATION]
@@ -230,17 +291,17 @@ class PostureAnalyzerV4:
         if len(frames) < 3:
             return False, meta
 
-        # falling_warning(standing_tilt 지속) 중에는 우선순위상 Freeze 경고는 띄우지 않음
+        # falling_warning 우선
         ok_fw, _ = self.is_falling_warning()
         if ok_fw:
             return False, meta
 
-        # standing 다수 비율 확인(standing_tilt는 제외)
+        # standing 비율 체크(standing_tilt는 제외)
         standing_count = sum(1 for f in frames if f.label == "standing")
         if (standing_count / len(frames)) < STANDING_MAJORITY_RATIO:
             return False, meta
 
-        # 평균 움직임 계산
+        # 평균 움직임 산출
         class P:
             __slots__ = ("x", "y")
             def __init__(self, x: float, y: float):
@@ -273,9 +334,14 @@ class PostureAnalyzerV4:
 
         return True, meta
 
-    # ----------------- 기존 이벤트(미사용; 남겨둠) ----------------- #
+    # ----------------- 구(레거시) 규칙(보존) ----------------- #
     def is_fall_detected(self) -> bool:
-        # 유지: 이전 로직(standing->lying 전이) — 현재 get_events에서는 사용하지 않음
+        """
+        과거 규칙(standing→lying 전이 기반). 현재 get_events()에서는 미사용이지만 보존.
+        - 마지막 라벨이 lying이고 ROI 밖이어야 함
+        - standing→lying 전이 시간이 FALL_TRANSITION_TIME 이내
+        - 중간에 sitting이 끼면 낙상으로 보지 않음
+        """
         if not self.buffer:
             return False
         last = self.buffer[-1]
@@ -299,7 +365,10 @@ class PostureAnalyzerV4:
         return True
 
     def is_prone_warning(self) -> bool:
-        # 유지(미사용)
+        """
+        엎드린 자세 경고(미사용 유지):
+        - lying 상태에서 코(z) - 엉덩이(z) 차이가 임계 미만
+        """
         if not self.buffer:
             return False
         last = self.buffer[-1]
@@ -316,7 +385,10 @@ class PostureAnalyzerV4:
         return (nose_z - hip_z) < POSE_Z_PRONE_THRESHOLD
 
     def is_irregular_movement(self) -> bool:
-        # 유지(미사용)
+        """
+        라벨 변화 횟수 기반의 불규칙 움직임(미사용 유지):
+        - 변경 횟수 ≥ ANALYZER_IRREGULAR_THRESHOLD
+        """
         changes = 0
         prev = None
         for f in self.buffer:
@@ -325,8 +397,9 @@ class PostureAnalyzerV4:
             prev = f.label
         return changes >= ANALYZER_IRREGULAR_THRESHOLD
 
-    # ----------------- meta helpers (그대로) ----------------- #
+    # ----------------- meta 유틸 ----------------- #
     def _meta_template(self, base: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
+        """메타 필드 스키마에 맞춰 기본값(None)으로 초기화 후 부분 덮어쓰기."""
         out = {k: None for k in META_KEYS}
         if base:
             for k in META_KEYS:
@@ -338,9 +411,10 @@ class PostureAnalyzerV4:
         return out
 
     def _normalize_meta(self, meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """메타 입력을 스키마에 맞게 정규화."""
         return self._meta_template(meta or {})
 
-    # ----------------- 이벤트 수집 (출력 형식 유지) ----------------- #
+    # ----------------- 이벤트 수집/발행 ----------------- #
     def _append_event(
         self,
         ev_type: str,
@@ -349,6 +423,10 @@ class PostureAnalyzerV4:
         severity: str = "warning",
         meta: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """
+        쿨다운을 고려해 이벤트 리스트에 1건을 추가.
+        - ev_type별 마지막 발행 이후 COOL_DOWN 이상 경과했을 때만 추가
+        """
         now = time.monotonic()
         last = self._last_event_ts.get(ev_type, 0.0)
         if (now - last) >= COOL_DOWN:
@@ -363,13 +441,12 @@ class PostureAnalyzerV4:
 
     def get_events(self) -> List[Dict[str, Any]]:
         """
-        요구사항 3가지만 이벤트로 내보내고,
-        추가로 'standing_freeze'를 경고로 내보냄.
-        출력 형식(type/severity/timestamp/message/meta)은 동일.
+        요구사항 3가지 이벤트 + standing_freeze 경고를 반환.
+        출력 형식(type/severity/timestamp/message/meta)은 통일 유지.
         """
         events: List[Dict[str, Any]] = []
 
-        # 1) falling_warning: standing_tilt 1초 이상
+        # 1) falling_warning
         ok, meta = self.is_falling_warning()
         if ok:
             self._append_event(
@@ -380,18 +457,18 @@ class PostureAnalyzerV4:
                 meta=meta,
             )
 
-        # 2) falling_detect: ROI 외부에서 1초 이상 sitting/lying
+        # 2) falling_detect (ROI 유무 규칙 반영)
         ok, meta = self.is_falling_detect()
         if ok:
             self._append_event(
                 "falling_detect",
-                "낙상 감지: ROI 외부에서 1초 이상 sitting/lying",
+                "낙상 감지: ROI 유무 규칙 기반 sitting/lying",
                 events,
                 severity="critical",
                 meta=meta,
             )
 
-        # 3) patient_escape: 1초 이상 사람 미검출
+        # 3) patient_escape
         ok, meta = self.is_patient_escape()
         if ok:
             self._append_event(
@@ -402,7 +479,7 @@ class PostureAnalyzerV4:
                 meta=meta,
             )
 
-        # 4) standing_freeze: 서있음 무동작 경고
+        # 4) standing_freeze
         ok, meta = self.is_standing_freeze()
         if ok:
             self._append_event(
