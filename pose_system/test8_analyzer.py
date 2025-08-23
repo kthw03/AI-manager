@@ -7,15 +7,12 @@ from person_detector import PersonDetector
 from pose_extractor import PoseExtractor
 from posture_wrapper import PostureClassifierWrapper
 
-# 분석기 import
+# 분석기 import (심플한 폴백)
 try:
     from posture_analyzer import PostureAnalyzerV4
 except Exception:
-    try:
-        from posture_analyzer import PostureAnalyzerV4
-    except Exception:
-        import posture_analyzer as pa
-        PostureAnalyzerV4 = pa.PostureAnalyzerV4
+    import posture_analyzer as pa
+    PostureAnalyzerV4 = pa.PostureAnalyzerV4
 
 # ROI 매니저 import
 try:
@@ -78,11 +75,11 @@ def main():
     pose_extractor = PoseExtractor()
     classifier = PostureClassifierWrapper()
 
-    # ROI 매니저: 자동 탐색 + 수동 드래그 병행
+    # ROI 매니저(자동 + 수동 4점 폴리곤)
     roi_manager = ROIManager(update_interval=8.0) if _HAS_ROI else None
     analyzer = PostureAnalyzerV4(roi_manager=roi_manager)
 
-    # 창 준비 + 마우스 콜백 연결(수동 ROI 드래그)
+    # 창 준비 + 마우스 콜백 연결(수동 ROI: 좌클릭 4점, 우클릭 되돌리기)
     win = "Analyzer Test"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, 960, 720)
@@ -102,10 +99,10 @@ def main():
             # ROI 자동 갱신 및 시각화
             if roi_manager:
                 try:
-                    roi_manager.auto_update(frame)   # 자동(YOLO) ROI
-                    display = roi_manager.draw(display)  # 자동+수동 모두 그림
+                    roi_manager.auto_update(frame)      # 자동(YOLO) ROI
                 except Exception:
                     pass
+                display = roi_manager.draw(display)     # 자동+수동 모두 그림
 
             # 사람 검출 및 대표 박스 선택
             boxes = detector.detect(frame)
@@ -141,54 +138,37 @@ def main():
 
             # 활성 경보 유지/해제
             ok_fw, _ = analyzer.is_falling_warning()
-            if ok_fw:
-                active_alerts["falling_warning"] = "낙상 경고: standing_tilt 1초 이상"
-            else:
-                active_alerts.pop("falling_warning", None)
+            active_alerts["falling_warning"] = "낙상 경고: standing_tilt 1초 이상" if ok_fw else active_alerts.pop("falling_warning", None)
 
             ok_fd, _ = analyzer.is_falling_detect()
-            if ok_fd:
-                active_alerts["falling_detect"] = "낙상 감지: ROI 유무 규칙 기반 sitting/lying"
-            else:
-                active_alerts.pop("falling_detect", None)
+            active_alerts["falling_detect"] = "낙상 감지: ROI 유무 규칙 기반 sitting/lying" if ok_fd else active_alerts.pop("falling_detect", None)
 
             ok_pe, _ = analyzer.is_patient_escape()
-            if ok_pe:
-                active_alerts["patient_escape"] = "환자 이탈: 1초 이상 사람 미검출"
-            else:
-                active_alerts.pop("patient_escape", None)
+            active_alerts["patient_escape"] = "환자 이탈: 1초 이상 사람 미검출" if ok_pe else active_alerts.pop("patient_escape", None)
 
             ok_sf, _ = analyzer.is_standing_freeze()
-            if ok_sf:
-                active_alerts["standing_freeze"] = "서 있는 상태에서 10초 이상 움직임 없음"
-            else:
-                active_alerts.pop("standing_freeze", None)
+            active_alerts["standing_freeze"] = "서 있는 상태에서 10초 이상 움직임 없음" if ok_sf else active_alerts.pop("standing_freeze", None)
 
-            # 상단 정보 라인 + 사용법
-            roi_status = "OFF"
-            if roi_manager:
-                try:
-                    auto_cnt = len(getattr(roi_manager, "auto_rois", []))
-                    manual_cnt = len(getattr(roi_manager, "manual_rois", []))
-                    edit_mode = getattr(roi_manager, "edit_enabled", False)
-                    roi_status = f"ON (auto:{auto_cnt}, manual:{manual_cnt}, edit:{'ON' if edit_mode else 'OFF'})"
-                except Exception:
-                    roi_status = "ON"
+            # 상단 정보 라인 + 사용법(4점/사다리꼴, 진행 점 카운트 표시)
+            auto_cnt = len(getattr(roi_manager, "auto_rois", [])) if roi_manager else 0
+            manual_cnt = len(getattr(roi_manager, "manual_rois", [])) if roi_manager else 0
+            edit_mode = getattr(roi_manager, "edit_enabled", False) if roi_manager else False
+            pending_pts = len(getattr(roi_manager, "_click_points", [])) if roi_manager else 0
             lines = [
                 f"State: {state}",
                 f"Last label: {analyzer.last_label}",
                 f"Events (this frame): {len(events)}",
                 f"Active alerts: {len(active_alerts)}",
-                f"ROI: {roi_status}",
-                "Keys: E=edit mode toggle  C=clear manual ROI  Q=quit  (우클릭: 되돌리기)",
-                "Edit ON 상태에서 마우스 드래그로 수동 ROI를 추가할 수 있습니다.",
+                f"ROI: {'ON' if roi_manager else 'OFF'} (auto:{auto_cnt}, manual:{manual_cnt}, edit:{'ON' if edit_mode else 'OFF'}, pending:{pending_pts}/4)",
+                "Keys: E=edit mode toggle  C=clear manual ROI  Q=quit  (우클릭=되돌리기)",
+                "Edit ON 상태에서 화면에 좌클릭 4번(순서 무관)으로 ROI(사다리꼴 포함)를 확정합니다.",
             ]
             put_text_lines(display, lines, org=(10, 30), color=(255, 255, 255))
 
             # 활성 경보 표시(우선순: detect > escape > freeze > warning)
             y_offset = 170
             for key in ["falling_detect", "patient_escape", "standing_freeze", "falling_warning"]:
-                if key in active_alerts:
+                if key in active_alerts and active_alerts[key]:
                     msg = f"[{key}] {active_alerts[key]}"
                     cv2.putText(display, msg, (10, y_offset),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
