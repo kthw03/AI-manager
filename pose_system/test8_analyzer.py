@@ -145,6 +145,13 @@ def main():
                 active_alerts["patient_escape"] = "환자 이탈: 1초 이상 사람 미검출"
             else:
                 active_alerts.pop("patient_escape", None)
+
+            # 추가: 서있음 무동작(standing_freeze) 경고 유지
+            ok_sf, _ = analyzer.is_standing_freeze()
+            if ok_sf:
+                active_alerts["standing_freeze"] = "서 있는 상태에서 10초 이상 움직임 없음"
+            else:
+                active_alerts.pop("standing_freeze", None)
             # ------------------------------------------------------
 
             # 상단 정보 라인
@@ -158,9 +165,9 @@ def main():
             ]
             put_text_lines(display, lines, org=(10, 30), color=(255, 255, 255))
 
-            # 🔴 활성 경보를 지속 표기 (중요도 순서: detect > escape > warning)
+            # 🔴 활성 경보를 지속 표기 (중요도 순서: detect > escape > freeze > warning)
             y_offset = 150
-            order = ["falling_detect", "patient_escape", "falling_warning"]
+            order = ["falling_detect", "patient_escape", "standing_freeze", "falling_warning"]
             for key in order:
                 if key in active_alerts:
                     msg = f"[{key}] {active_alerts[key]}"
