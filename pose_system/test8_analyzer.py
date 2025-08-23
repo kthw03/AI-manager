@@ -8,7 +8,7 @@ from person_detector import PersonDetector
 from pose_extractor import PoseExtractor
 from posture_wrapper import PostureClassifierWrapper
 
-# analyzer import
+# analyzer import (v4)
 import posture_analyzer as pa  # file should define PostureAnalyzerV4
 
 # optional ROI manager (safe import)
@@ -75,6 +75,9 @@ def main():
 
     last_event_print_ts = 0.0
 
+    # 활성 경보를 유지하는 딕셔너리: 조건이 해제되기 전까지 화면에 계속 표시
+    active_alerts = {}  # key -> message
+
     try:
         while True:
             frame = handler.get_frame()
@@ -83,6 +86,7 @@ def main():
 
             display = frame.copy()
 
+            # ROI update/draw (if available)
             if roi_manager and hasattr(roi_manager, "update"):
                 try:
                     roi_manager.update(frame)
@@ -121,24 +125,50 @@ def main():
                 analyzer.update(label="no_person", landmarks=None, bbox=None)
 
             state = analyzer.get_state()
-            events = analyzer.get_events()
+            events = analyzer.get_events()  # 쿨다운 적용된 "새로 발생한" 이벤트들
 
+            # ---- 활성 경보 갱신: 조건 참/해제에 따라 켜고 끄기 ----
+            ok_fw, _ = analyzer.is_falling_warning()
+            if ok_fw:
+                active_alerts["falling_warning"] = "낙상 경고: standing_tilt 1초 이상"
+            else:
+                active_alerts.pop("falling_warning", None)
+
+            ok_fd, _ = analyzer.is_falling_detect()
+            if ok_fd:
+                active_alerts["falling_detect"] = "낙상 감지: ROI 외부에서 1초 이상 sitting/lying"
+            else:
+                active_alerts.pop("falling_detect", None)
+
+            ok_pe, _ = analyzer.is_patient_escape()
+            if ok_pe:
+                active_alerts["patient_escape"] = "환자 이탈: 1초 이상 사람 미검출"
+            else:
+                active_alerts.pop("patient_escape", None)
+            # ------------------------------------------------------
+
+            # 상단 정보 라인
             lines = [
                 f"State: {state}",
                 f"Last label: {analyzer.last_label}",
-                f"Events (this frame): {len(events)}",
+                f"Events (this frame): {len(events)}",   # 새로 발생한 이벤트 개수
+                f"Active alerts: {len(active_alerts)}",  # 현재 유지 중인 경보 수
                 f"ROI: {'ON' if roi_manager else 'OFF'}",
                 "Press 'q' to quit",
             ]
             put_text_lines(display, lines, org=(10, 30), color=(255, 255, 255))
 
-            y_offset = 130
-            for ev in events[:5]:
-                msg = f"[{ev.get('type')}] {ev.get('message')}"
-                cv2.putText(display, msg, (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                y_offset += 22
+            # 🔴 활성 경보를 지속 표기 (중요도 순서: detect > escape > warning)
+            y_offset = 150
+            order = ["falling_detect", "patient_escape", "falling_warning"]
+            for key in order:
+                if key in active_alerts:
+                    msg = f"[{key}] {active_alerts[key]}"
+                    cv2.putText(display, msg, (10, y_offset),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    y_offset += 24
 
+            # 콘솔 로그: 새 이벤트가 있을 때만 출력(여전히 쿨다운 영향)
             now = time.monotonic()
             if events and (now - last_event_print_ts) > 0.2:
                 for ev in events:
