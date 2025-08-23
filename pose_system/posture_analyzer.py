@@ -1,5 +1,4 @@
 # posture_analyzer_v4.py
-
 import time
 from collections import deque, namedtuple
 from typing import Deque, List, Dict, Optional, Tuple, Any
@@ -22,11 +21,20 @@ AnalyzedFrame = namedtuple(
 
 COOL_DOWN = 5.0
 
+# 메타 키(출력 형식 유지)
 META_KEYS = ("in_roi", "duration_sec", "changes", "threshold", "nose_minus_hip_z")
 
+# === 신규 규칙 임계값 (요구사항) ===
+STANDING_TILT_DURATION = 1.0          # 1) standing_tilt 1초 이상 → falling_warning
+OFFROI_LOWPOSTURE_DURATION = 1.0      # 2) ROI 밖에서 sitting/lying 1초 이상 → falling_detect
+NO_PERSON_DURATION = 1.0              # 3) 1초 이상 사람 미검출 → patient_escape
 
 def _is_lying(label: str) -> bool:
     return label.startswith("lying")
+
+def _is_low_posture(label: str) -> bool:
+    # sitting 또는 lying 전체 포함
+    return (label == "sitting") or _is_lying(label)
 
 
 class PostureAnalyzerV4:
@@ -68,7 +76,14 @@ class PostureAnalyzerV4:
             except Exception:
                 in_roi = True
 
-        cutoff = now_mon - max(TILT_DURATION, NO_MOVEMENT_TIME_THRESHOLD)
+        # 버퍼 윈도우 유지: 기존 임계 + 신규 1초 윈도우까지 보장
+        cutoff = now_mon - max(
+            TILT_DURATION,
+            NO_MOVEMENT_TIME_THRESHOLD,
+            STANDING_TILT_DURATION,
+            OFFROI_LOWPOSTURE_DURATION,
+            NO_PERSON_DURATION,
+        )
         while self.buffer and self.buffer[0].monotonic_ts < cutoff:
             self.buffer.popleft()
 
@@ -77,6 +92,7 @@ class PostureAnalyzerV4:
         )
         self.last_label = label
 
+    # ----------------- 기존 상태 조회(유지) ----------------- #
     def get_state(self) -> str:
         now = time.monotonic()
         if self._check_tilt(now):
@@ -85,8 +101,7 @@ class PostureAnalyzerV4:
             return "motionless"
         return self.last_label or "unknown"
 
-    # ----------------- internal sustained checks ----------------- #
-
+    # ----------------- internal sustained checks (기존 유지) ----------------- #
     def _check_tilt(self, now: float) -> bool:
         ys: List[float] = []
         for f in reversed(self.buffer):
@@ -155,9 +170,50 @@ class PostureAnalyzerV4:
             return False
         return self.buffer[-2].label == from_label and self.buffer[-1].label == to_label
 
-    # ----------------- event primitives ----------------- #
+    # ----------------- 새 규칙: 이벤트 판정 ----------------- #
+    def _window(self, duration: float) -> List[AnalyzedFrame]:
+        """최근 duration 초의 프레임 집합 반환."""
+        now = time.monotonic()
+        return [f for f in self.buffer if (now - f.monotonic_ts) <= duration]
 
+    def is_falling_warning(self) -> Tuple[bool, Dict[str, Any]]:
+        """
+        1) falling_warning: classifier 라벨 'standing_tilt'가 1초 이상 지속.
+        """
+        frames = self._window(STANDING_TILT_DURATION)
+        ok = bool(frames) and all(f.label == "standing_tilt" for f in frames)
+        meta = self._meta_template(duration_sec=float(STANDING_TILT_DURATION))
+        return ok, meta
+
+    def is_falling_detect(self) -> Tuple[bool, Dict[str, Any]]:
+        """
+        2) falling_detect: ROI(침대/의자) 외부에서 1초 이상 sitting/lying 유지.
+        """
+        frames = self._window(OFFROI_LOWPOSTURE_DURATION)
+        if not frames:
+            return False, self._meta_template(duration_sec=float(OFFROI_LOWPOSTURE_DURATION))
+        ok = all((not f.in_roi) and _is_low_posture(f.label) for f in frames)
+        meta = self._meta_template(
+            in_roi=(frames[-1].in_roi if frames else None),
+            duration_sec=float(OFFROI_LOWPOSTURE_DURATION),
+        )
+        return ok, meta
+
+    def is_patient_escape(self) -> Tuple[bool, Dict[str, Any]]:
+        """
+        3) patient_escape: 1초 이상 '사람 미검출' 상태.
+           - 라벨이 'no_person'으로 들어온다고 가정.
+        """
+        frames = self._window(NO_PERSON_DURATION)
+        if not frames:
+            return False, self._meta_template(duration_sec=float(NO_PERSON_DURATION))
+        ok = all((f.label == "no_person") for f in frames)
+        meta = self._meta_template(duration_sec=float(NO_PERSON_DURATION))
+        return ok, meta
+
+    # ----------------- 기존 이벤트(미사용; 남겨둠) ----------------- #
     def is_fall_detected(self) -> bool:
+        # 유지: 이전 로직(standing->lying 전이) — 현재 get_events에서는 사용하지 않음
         if not self.buffer:
             return False
         last = self.buffer[-1]
@@ -181,6 +237,7 @@ class PostureAnalyzerV4:
         return True
 
     def is_prone_warning(self) -> bool:
+        # 유지(미사용)
         if not self.buffer:
             return False
         last = self.buffer[-1]
@@ -197,6 +254,7 @@ class PostureAnalyzerV4:
         return (nose_z - hip_z) < POSE_Z_PRONE_THRESHOLD
 
     def is_irregular_movement(self) -> bool:
+        # 유지(미사용)
         changes = 0
         prev = None
         for f in self.buffer:
@@ -205,8 +263,7 @@ class PostureAnalyzerV4:
             prev = f.label
         return changes >= ANALYZER_IRREGULAR_THRESHOLD
 
-    # ----------------- meta unification helpers ----------------- #
-
+    # ----------------- meta helpers (그대로) ----------------- #
     def _meta_template(self, base: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
         out = {k: None for k in META_KEYS}
         if base:
@@ -221,61 +278,7 @@ class PostureAnalyzerV4:
     def _normalize_meta(self, meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return self._meta_template(meta or {})
 
-    # ----------------- unified public event wrappers ----------------- #
-
-    def is_motionless_sustained(self) -> Tuple[bool, Dict[str, Any]]:
-        now = time.monotonic()
-        ok = self._check_motionless(now)
-        last = self.buffer[-1] if self.buffer else None
-        meta = self._meta_template(
-            duration_sec=float(NO_MOVEMENT_TIME_THRESHOLD),
-            in_roi=(last.in_roi if last else None),
-        )
-        return ok, meta
-
-    def is_tilt_sustained(self) -> Tuple[bool, Dict[str, Any]]:
-        now = time.monotonic()
-        ok = self._check_tilt(now)
-        meta = self._meta_template(duration_sec=float(TILT_DURATION))
-        return ok, meta
-
-    def is_fall_event(self) -> Tuple[bool, Dict[str, Any]]:
-        ok = self.is_fall_detected()
-        last = self.buffer[-1] if self.buffer else None
-        meta = self._meta_template(in_roi=(last.in_roi if last else None))
-        return ok, meta
-
-    def is_prone_event(self) -> Tuple[bool, Dict[str, Any]]:
-        ok = self.is_prone_warning()
-        nmhz = None
-        if self.buffer and self.buffer[-1].landmarks and len(self.buffer[-1].landmarks) > 24:
-            try:
-                lm = self.buffer[-1].landmarks
-                nmhz = lm[0][2] - (lm[23][2] + lm[24][2]) / 2.0
-            except Exception:
-                nmhz = None
-        meta = self._meta_template(
-            nose_minus_hip_z=nmhz,
-            threshold=float(POSE_Z_PRONE_THRESHOLD),
-        )
-        return ok, meta
-
-    def is_irregular_event(self) -> Tuple[bool, Dict[str, Any]]:
-        changes = 0
-        prev = None
-        for f in self.buffer:
-            if prev is not None and f.label != prev:
-                changes += 1
-            prev = f.label
-        ok = changes >= ANALYZER_IRREGULAR_THRESHOLD
-        meta = self._meta_template(
-            changes=int(changes),
-            threshold=int(ANALYZER_IRREGULAR_THRESHOLD),
-        )
-        return ok, meta
-
-    # ----------------- event collection with cooldown ----------------- #
-
+    # ----------------- 이벤트 수집 (출력 형식 유지) ----------------- #
     def _append_event(
         self,
         ev_type: str,
@@ -297,59 +300,42 @@ class PostureAnalyzerV4:
             self._last_event_ts[ev_type] = now
 
     def get_events(self) -> List[Dict[str, Any]]:
+        """
+        요구사항 3가지만 이벤트로 내보냄.
+        출력 형식(type/severity/timestamp/message/meta)은 동일.
+        """
         events: List[Dict[str, Any]] = []
 
-        ok, meta = self.is_fall_event()
+        # 1) falling_warning: standing_tilt 1초 이상
+        ok, meta = self.is_falling_warning()
         if ok:
             self._append_event(
-                "fall_detected",
-                "낙상 감지: ROI 외부에서 standing→lying 전이",
-                events,
-                severity="critical",
-                meta=meta,
-            )
-
-        ok, meta = self.is_prone_event()
-        if ok:
-            self._append_event(
-                "prone_warning",
-                "엎드린 자세 감지: 호흡곤란 우려",
+                "falling_warning",
+                "낙상 경고: standing_tilt 1초 이상",
                 events,
                 severity="warning",
                 meta=meta,
             )
 
-        ok, meta = self.is_motionless_sustained()
+        # 2) falling_detect: ROI 외부에서 1초 이상 sitting/lying
+        ok, meta = self.is_falling_detect()
         if ok:
-            last = self.buffer[-1] if self.buffer else None
-            in_roi_txt = ""
-            if last and last.in_roi is False:
-                in_roi_txt = "ROI 외부에서 "
             self._append_event(
-                "danger_motionless",
-                f"위험 무동작: {in_roi_txt}{NO_MOVEMENT_TIME_THRESHOLD:.0f}초 이상 움직임 없음",
+                "falling_detect",
+                "낙상 감지: ROI 외부에서 1초 이상 sitting/lying",
                 events,
                 severity="critical",
                 meta=meta,
             )
 
-        ok, meta = self.is_irregular_event()
+        # 3) patient_escape: 1초 이상 사람 미검출
+        ok, meta = self.is_patient_escape()
         if ok:
             self._append_event(
-                "irregular_movement",
-                "비정상적 자세 변화 빈번",
+                "patient_escape",
+                "환자 이탈: 1초 이상 사람 미검출",
                 events,
-                severity="warning",
-                meta=meta,
-            )
-
-        ok, meta = self.is_tilt_sustained()
-        if ok:
-            self._append_event(
-                "tilt_sustained",
-                f"기울임 상태 {TILT_DURATION:.0f}초 이상 지속",
-                events,
-                severity="info",
+                severity="critical",
                 meta=meta,
             )
 
