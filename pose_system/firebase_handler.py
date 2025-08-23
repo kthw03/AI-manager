@@ -1,60 +1,58 @@
-#firebase_handler.py
-import cv2
 from datetime import datetime
 import firebase_admin
-from firebase_admin import credentials, db, storage
+from firebase_admin import credentials, db
 
-DATABASE_URL = "https://hann-7b7be-default-rtdb.firebaseio.com/"
+DATABASE_URL = "https://hann-7b7be-default-rtdb.firebaseio.com"
 SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
-STORAGE_BUCKET = "hann-7b7be.appspot.com"
 
-def _ensure_init():
-    if not firebase_admin._apps:
+_initialized = False
+
+def _ensure_init() -> bool:
+    global _initialized
+    if _initialized and firebase_admin._apps:
+        return True
+    try:
         cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-        firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL, "storageBucket": STORAGE_BUCKET})
-        try:
-            storage.bucket()
-        except Exception as e:
-            print(f"[FB] init check failed: {e}")
+        firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+        _initialized = True
+        print(f"[FB] init ok | db={DATABASE_URL}")
+        return True
+    except Exception as e:
+        print(f"[FB][ERROR] init failed: {e}")
+        return False
 
-def upload_posture(device_id: str, label: str, view: str, bbox=None, ts: str | None = None, anomalies: dict | None = None):
-    _ensure_init()
+def upload_posture(device_id: str,
+                   label: str,
+                   view: str,
+                   bbox=None,
+                   ts: str | None = None,
+                   anomalies: dict | None = None,
+                   state: str | None = None) -> bool:
+    if not _ensure_init():
+        return False
     if ts is None:
         ts = datetime.now().isoformat(timespec="seconds")
     payload = {
         "label": label,
         "view": view,
-        "bbox": {
+        "bbox": ({
             "x1": int(bbox[0]), "y1": int(bbox[1]),
             "x2": int(bbox[2]), "y2": int(bbox[3])
-        } if bbox else None,
+        } if bbox else None),
         "ts": ts,
-        "anomalies": anomalies or {}
+        "state": state,
+        "anomalies": (anomalies or {
+            "falling_warning": False,
+            "falling_detect": False,
+            "patient_escape": False,
+            "standing_freeze": False
+        })
     }
-    db.reference(f"devices/{device_id}/events").push(payload)
-    db.reference(f"devices/{device_id}/posture").set(payload)
-
-def upload_frame(device_id: str, frame_bgr, jpeg_quality: int = 85) -> str:
-    _ensure_init()
-    ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
-    if not ok:
-        raise RuntimeError("JPEG encode failed")
-    now = datetime.now()
-    date_folder = now.strftime("%Y%m%d")
-    fname = now.strftime("%H%M%S") + ".jpg"
-    path = f"frames/{device_id}/{date_folder}/{fname}"
-    bucket = storage.bucket()
-    blob = bucket.blob(path)
-    blob.upload_from_string(buf.tobytes(), content_type="image/jpeg")
     try:
-        blob.make_public()
-        url = blob.public_url
+        db.reference(f"devices/{device_id}/events").push(payload)
+        db.reference(f"devices/{device_id}/posture").set(payload)
+        print(f"[FB] RTDB write ok @ {ts}")
+        return True
     except Exception as e:
-        print(f"[FB][WARN] make_public failed: {e}")
-        url = blob.generate_signed_url(expiration=3600)
-    db.reference(f"devices/{device_id}/last_image").set({
-        "url": url,
-        "path": path,
-        "ts": now.isoformat(timespec="seconds")
-    })
-    return url
+        print(f"[FB][ERROR] RTDB write failed: {e} | db={DATABASE_URL}")
+        return False
