@@ -29,6 +29,10 @@ STANDING_TILT_DURATION = 1.0          # 1) standing_tilt 1초 이상 → falling
 OFFROI_LOWPOSTURE_DURATION = 1.0      # 2) ROI 밖에서 sitting/lying 1초 이상 → falling_detect
 NO_PERSON_DURATION = 1.0              # 3) 1초 이상 사람 미검출 → patient_escape
 
+# === 서있음 무동작(추가 제안 4) ===
+STANDING_FREEZE_DURATION = 10.0       # 서있음에서 무동작 지속 시간
+STANDING_MAJORITY_RATIO = 0.70        # 윈도우 내 standing 비율 임계
+
 def _is_lying(label: str) -> bool:
     return label.startswith("lying")
 
@@ -76,13 +80,14 @@ class PostureAnalyzerV4:
             except Exception:
                 in_roi = True
 
-        # 버퍼 윈도우 유지: 기존 임계 + 신규 1초 윈도우까지 보장
+        # 버퍼 윈도우 유지: 기존 임계 + 신규 임계들까지 보장
         cutoff = now_mon - max(
             TILT_DURATION,
             NO_MOVEMENT_TIME_THRESHOLD,
             STANDING_TILT_DURATION,
             OFFROI_LOWPOSTURE_DURATION,
             NO_PERSON_DURATION,
+            STANDING_FREEZE_DURATION,  # ← 추가
         )
         while self.buffer and self.buffer[0].monotonic_ts < cutoff:
             self.buffer.popleft()
@@ -211,6 +216,63 @@ class PostureAnalyzerV4:
         meta = self._meta_template(duration_sec=float(NO_PERSON_DURATION))
         return ok, meta
 
+    def is_standing_freeze(self) -> Tuple[bool, Dict[str, Any]]:
+        """
+        4) standing_freeze: 서 있는 상태에서 장시간(기본 10초) 움직임이 거의 없을 때 경고.
+           - 윈도우 내 standing 비율 ≥ STANDING_MAJORITY_RATIO
+           - 평균 움직임 < ANALYZER_MOTION_THRESHOLD
+           - standing_tilt 경고 활성 중이면 중복 경고 방지로 제외
+        """
+        now = time.monotonic()
+        frames = [f for f in self.buffer if now - f.monotonic_ts <= STANDING_FREEZE_DURATION]
+        meta = self._meta_template(duration_sec=float(STANDING_FREEZE_DURATION))
+
+        if len(frames) < 3:
+            return False, meta
+
+        # falling_warning(standing_tilt 지속) 중에는 우선순위상 Freeze 경고는 띄우지 않음
+        ok_fw, _ = self.is_falling_warning()
+        if ok_fw:
+            return False, meta
+
+        # standing 다수 비율 확인(standing_tilt는 제외)
+        standing_count = sum(1 for f in frames if f.label == "standing")
+        if (standing_count / len(frames)) < STANDING_MAJORITY_RATIO:
+            return False, meta
+
+        # 평균 움직임 계산
+        class P:
+            __slots__ = ("x", "y")
+            def __init__(self, x: float, y: float):
+                self.x, self.y = x, y
+
+        total, pair_count = 0.0, 0
+        for prev, curr in zip(frames, frames[1:]):
+            if not prev.landmarks or not curr.landmarks:
+                continue
+            L = min(len(prev.landmarks), len(curr.landmarks))
+            if L == 0:
+                continue
+            move_sum = 0.0
+            for i in range(L):
+                try:
+                    ax, ay = prev.landmarks[i][0], prev.landmarks[i][1]
+                    bx, by = curr.landmarks[i][0], curr.landmarks[i][1]
+                except Exception:
+                    continue
+                move_sum += calculate_euclidean_distance(P(ax, ay), P(bx, by))
+            total += (move_sum / max(L, 1))
+            pair_count += 1
+
+        if pair_count == 0:
+            return False, meta
+
+        avg_motion = total / pair_count
+        if avg_motion >= ANALYZER_MOTION_THRESHOLD:
+            return False, meta
+
+        return True, meta
+
     # ----------------- 기존 이벤트(미사용; 남겨둠) ----------------- #
     def is_fall_detected(self) -> bool:
         # 유지: 이전 로직(standing->lying 전이) — 현재 get_events에서는 사용하지 않음
@@ -301,7 +363,8 @@ class PostureAnalyzerV4:
 
     def get_events(self) -> List[Dict[str, Any]]:
         """
-        요구사항 3가지만 이벤트로 내보냄.
+        요구사항 3가지만 이벤트로 내보내고,
+        추가로 'standing_freeze'를 경고로 내보냄.
         출력 형식(type/severity/timestamp/message/meta)은 동일.
         """
         events: List[Dict[str, Any]] = []
@@ -336,6 +399,17 @@ class PostureAnalyzerV4:
                 "환자 이탈: 1초 이상 사람 미검출",
                 events,
                 severity="critical",
+                meta=meta,
+            )
+
+        # 4) standing_freeze: 서있음 무동작 경고
+        ok, meta = self.is_standing_freeze()
+        if ok:
+            self._append_event(
+                "standing_freeze",
+                f"서 있는 상태에서 {STANDING_FREEZE_DURATION:.0f}초 이상 움직임 없음",
+                events,
+                severity="warning",
                 meta=meta,
             )
 
