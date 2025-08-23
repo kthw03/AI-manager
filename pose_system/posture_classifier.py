@@ -17,7 +17,7 @@ class PostureClassifierV6:
 
         # Lying thresholds
         self.Y_RANGE_LYING     = 0.05   # 세로 평탄도 임계
-        self.X_RANGE_LYING     = 0.30   # 가로 퍼짐 임계 (튜닝 요망)
+        self.X_RANGE_LYING     = 0.50   # 가로 퍼짐 임계 (튜닝 요망)
         self.Z_PRONE_THRESHOLD = 0.0    # supine/prone 구분용
 
         # Kneeling torso range
@@ -95,7 +95,18 @@ class PostureClassifierV6:
     def is_standing(self, landmarks, angles, y_vals):
         if angles["leg"] < 155:
             return False
-        if angles["torso"] < 150:
+        if angles["torso"] < 155:
+            return False
+        if y_vals["hip_avg"] >= y_vals["knee_avg"] + 0.02:
+            return False
+        if y_vals["nose"] >= y_vals["hip_avg"]:
+            return False
+        return True
+
+    def is_standing_tilt(self, landmarks, angles, y_vals):
+        if angles["leg"] < 155:
+            return False
+        if angles["torso"] >= 155:
             return False
         if y_vals["hip_avg"] >= y_vals["knee_avg"] + 0.02:
             return False
@@ -115,5 +126,7 @@ class PostureClassifierV6:
             return lying
         if self.is_standing(landmarks, angles, y_vals):
             return "standing"
+        if self.is_standing_tilt(landmarks, angles, y_vals):
+            return "standing_tilt"
         return "irregular"
 
