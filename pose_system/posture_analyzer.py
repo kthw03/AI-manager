@@ -216,17 +216,26 @@ class PostureAnalyzerV4:
     def _has_roi(self) -> bool:
         """
         ROI 보유 여부 확인:
-        - roi_manager가 존재하고
-        - get_rois() 또는 rois 속성에 1개 이상 ROI가 있을 때 True
+        - bbox 기반(get_rois()/rois)에 1개 이상 있거나
+        - 사다리꼴 등 수동 폴리곤(manual_polygons)이 1개 이상이면 True
         """
         if not self.roi_manager:
             return False
         try:
+            # 1) bbox 기반(자동+수동 사각형)
             if hasattr(self.roi_manager, "get_rois"):
                 rois = self.roi_manager.get_rois()
             else:
                 rois = getattr(self.roi_manager, "rois", None)
-            return bool(rois and len(rois) > 0)
+            if rois and len(rois) > 0:
+                return True
+
+            # 2) 폴리곤 기반(수동 사다리꼴 ROI)
+            polys = getattr(self.roi_manager, "manual_polygons", None)
+            if polys and len(polys) > 0:
+                return True
+
+            return False
         except Exception:
             return False
 
