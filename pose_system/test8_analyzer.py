@@ -1,3 +1,5 @@
+# test10_analyzer.py
+
 import time
 import cv2
 import mediapipe as mp
@@ -89,6 +91,14 @@ def main():
     last_event_print_ts = 0.0
     active_alerts = {}
 
+    # ---- FIX: 경보 on/off를 확실히 반영하는 헬퍼 (해제 시 키 제거) ----
+    def set_alert(key: str, is_on: bool, msg: str):
+        if is_on:
+            active_alerts[key] = msg
+        else:
+            active_alerts.pop(key, None)
+    # -------------------------------------------------------------------
+
     try:
         while True:
             frame = handler.get_frame()
@@ -136,18 +146,18 @@ def main():
             state = analyzer.get_state()
             events = analyzer.get_events()
 
-            # 활성 경보 유지/해제
+            # 활성 경보 유지/해제 (우선순위 표시는 아래 draw 구간에서 처리)
             ok_fw, _ = analyzer.is_falling_warning()
-            active_alerts["falling_warning"] = "낙상 경고: standing_tilt 1초 이상" if ok_fw else active_alerts.pop("falling_warning", None)
+            set_alert("falling_warning", ok_fw, "낙상 경고: standing_tilt 1초 이상")
 
             ok_fd, _ = analyzer.is_falling_detect()
-            active_alerts["falling_detect"] = "낙상 감지: ROI 유무 규칙 기반 sitting/lying" if ok_fd else active_alerts.pop("falling_detect", None)
+            set_alert("falling_detect", ok_fd, "낙상 감지: ROI 유무 규칙 기반 sitting/lying")
 
             ok_pe, _ = analyzer.is_patient_escape()
-            active_alerts["patient_escape"] = "환자 이탈: 1초 이상 사람 미검출" if ok_pe else active_alerts.pop("patient_escape", None)
+            set_alert("patient_escape", ok_pe, "환자 이탈: 1초 이상 사람 미검출")
 
             ok_sf, _ = analyzer.is_standing_freeze()
-            active_alerts["standing_freeze"] = "서 있는 상태에서 10초 이상 움직임 없음" if ok_sf else active_alerts.pop("standing_freeze", None)
+            set_alert("standing_freeze", ok_sf, "서 있는 상태에서 10초 이상 움직임 없음")
 
             # 상단 정보 라인 + 사용법(4점/사다리꼴, 진행 점 카운트 표시)
             auto_cnt = len(getattr(roi_manager, "auto_rois", [])) if roi_manager else 0
